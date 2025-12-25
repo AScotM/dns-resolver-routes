@@ -11,10 +11,8 @@ import logging
 from enum import IntEnum
 import json
 from collections import defaultdict, OrderedDict
-import contextlib
 import threading
 import hashlib
-from functools import lru_cache
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 
@@ -303,7 +301,7 @@ class DNSResolver:
         domain: str,
         query_type: DNSRecordType,
         dnssec: bool = False
-    ) -> Tuple[bytes, int]:
+    ) -> Tuple[bytes, int, int]:
         if domain != "." and not self.is_valid_domain(domain):
             raise ValueError(f"Invalid domain name: {domain}")
 
@@ -654,7 +652,7 @@ class DNSResolver:
 
     def _release_pending(self):
         with self._pending_lock:
-            self._pending_queries -= 1
+            self._pending_queries = max(0, self._pending_queries - 1)
 
     def _send_query(self, query: bytes, server: Tuple[str, int], source_port: int = None) -> bytes:
         self._apply_rate_limit(server)
@@ -693,7 +691,11 @@ class DNSResolver:
                         
                         if source_port and source_port > 0:
                             try:
+                                sock.close()
+                                sock = socket.socket(family, socket.SOCK_DGRAM)
+                                sock.settimeout(self.timeout)
                                 sock.bind(('', source_port))
+                                self._udp_sockets[(server[0], server[1], family)] = sock
                             except:
                                 pass
                         
@@ -773,12 +775,14 @@ class DNSResolver:
         servers = [server] if server else self._select_servers(query_type)
         
         cache_key = None
-        if self.enable_cache and server:
-            cache_key = self._get_cache_key(domain, query_type, server)
-            cached = self._get_from_cache(cache_key)
-            if cached:
-                logger.debug(f"Cache hit for {domain} ({query_type.name})")
-                return cached
+        if self.enable_cache:
+            server_for_cache = server or self.dns_servers[0] if servers else None
+            if server_for_cache:
+                cache_key = self._get_cache_key(domain, query_type, server_for_cache)
+                cached = self._get_from_cache(cache_key)
+                if cached:
+                    logger.debug(f"Cache hit for {domain} ({query_type.name})")
+                    return cached
 
         last_errors = []
 
@@ -849,8 +853,10 @@ class DNSResolver:
         if not self.enable_async:
             raise RuntimeError("Async mode not enabled")
         
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
+        if self._loop is None:
+            self._loop = asyncio.new_event_loop()
+        
+        return await self._loop.run_in_executor(
             self._executor,
             lambda: self.resolve(domain, query_type, server, follow_cnames)
         )
@@ -935,7 +941,7 @@ class DNSResolver:
             self._udp_sockets.clear()
         
         if self._executor:
-            self._executor.shutdown(wait=False)
+            self._executor.shutdown(wait=True)
         
         if self._loop:
             self._loop.close()
